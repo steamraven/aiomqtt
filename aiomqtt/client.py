@@ -1,6 +1,6 @@
 import functools
 import asyncio
-
+from asyncio import iscoroutine
 from paho.mqtt.client import Client as _Client
 
 
@@ -65,6 +65,21 @@ class Client(object):
     # Utility functions for creating wrappers
     ###########################################################################
 
+    async def _notify_callback_async(self, f):
+        try:
+            self._in_callback = True
+            await f
+        finally:
+            self._in_callback = False
+
+    def _notify_callback(self, f, *args):
+        try:
+            self._in_callback = True
+            f(self, *args)
+        finally:
+            self._in_callback = False
+
+
     def _wrap_callback(self, name):
         """Add the named callback to the MQTT client which triggers a call to
         the wrapper's registered callback in the event loop thread.
@@ -74,7 +89,12 @@ class Client(object):
         def wrapper(_client, *args):
             f = getattr(self, name)
             if f is not None:
-                self._loop.call_soon_threadsafe(f, self, *args)
+                if iscoroutinefunction(f):
+                    self._loop.create_task(self._notify_callback_async(f(*args))
+                elif iscoroutine(f):
+                    self._loop.create_task(self._notify_callback_async(f)
+                else:
+                    self._loop.call_soon_threadsafe(self._notify_callback, f, *args)
         setattr(self._client, name, wrapper)
 
     def _wrap_blocking_method(self, name):

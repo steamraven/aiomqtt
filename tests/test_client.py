@@ -135,7 +135,7 @@ async def test_pub_sub(server, hostname, port, event_loop):
     c.on_unsubscribe = Mock(side_effect=lambda *_: unsubscribe_event.set())
 
     disconnect_event = asyncio.Event(loop=event_loop)
-    c.on_disconnect = Mock(size_effect=lambda *_: disconnect_event.set())
+    c.on_disconnect = Mock(side_effect=lambda *_: disconnect_event.set())
 
     try:
         c.connect_async(hostname, port)
@@ -191,11 +191,10 @@ async def test_pub_sub(server, hostname, port, event_loop):
             unsubscribe_event.wait(), timeout=5, loop=event_loop)
         c.on_unsubscribe.assert_called_once_with(c, None, mid)
         c.disconnect()
-
-
-    finally:
         await asyncio.wait_for(disconnect_event.wait(), timeout=5,
                                loop=event_loop)
+    finally:
+        pass
 
     assert len(c.on_connect.mock_calls) == 1
     assert len(c.on_subscribe.mock_calls) == 1
@@ -203,3 +202,4 @@ async def test_pub_sub(server, hostname, port, event_loop):
     assert len(c.on_message.mock_calls) == 1
     assert len(message_callback.mock_calls) == 1
     assert len(c.on_unsubscribe.mock_calls) == 1
+    assert len(c.on_disconnect.mock_calls) == 1

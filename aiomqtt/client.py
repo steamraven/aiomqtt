@@ -136,7 +136,7 @@ class Client(object):
     @functools.wraps(_Client.connect_async)
     def connect_async(self, host, port=1883, keepalive=60, bind_address=""):
         self._client.connect_async(host, port, keepalive, bind_address)
-        self.reconnect_task =  self._loop.create_task(self.reconnect())
+        self.reconnect_task = self._loop.create_task(self.reconnect())
         return self.reconnect_task
 
     def _socket_read_ssl(self):

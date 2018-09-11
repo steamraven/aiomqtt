@@ -1,6 +1,9 @@
-import functools
 import asyncio
-from asyncio import iscoroutine
+import functools
+from asyncio import (CancelledError, iscoroutinefunction,
+                     run_coroutine_threadsafe)
+
+from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
 
 
@@ -46,6 +49,8 @@ class Client(object):
         self._loop = loop or asyncio.get_event_loop()
         self._client = _Client(*args, **kwargs)
 
+        self.misc_task = None
+
         self._wrap_blocking_method("connect")
         self._wrap_blocking_method("connect_srv")
         self._wrap_blocking_method("reconnect")
@@ -54,33 +59,24 @@ class Client(object):
         self._wrap_blocking_method("loop_stop")
 
         self._wrap_callback("on_connect")
-        self._wrap_callback("on_disconnect")
+        self._wrap_callback("on_disconnect", self._on_disconnect)
         self._wrap_callback("on_message")
         self._wrap_callback("on_publish")
         self._wrap_callback("on_subscribe")
         self._wrap_callback("on_unsubscribe")
         self._wrap_callback("on_log")
+        self._wrap_callback("on_socket_open", self._on_socket_open)
+        self._wrap_callback("on_socket_close", self._on_socket_close)
+        self._wrap_callback("on_socket_register_write",
+                            self._on_socket_register_write)
+        self._wrap_callback("on_socket_unregister_write",
+                            self._on_socket_unregister_write)
 
     ###########################################################################
     # Utility functions for creating wrappers
     ###########################################################################
 
-    async def _notify_callback_async(self, f):
-        try:
-            self._in_callback = True
-            await f
-        finally:
-            self._in_callback = False
-
-    def _notify_callback(self, f, *args):
-        try:
-            self._in_callback = True
-            f(self, *args)
-        finally:
-            self._in_callback = False
-
-
-    def _wrap_callback(self, name):
+    def _wrap_callback(self, name, internal_callback=None):
         """Add the named callback to the MQTT client which triggers a call to
         the wrapper's registered callback in the event loop thread.
         """
@@ -90,12 +86,18 @@ class Client(object):
             f = getattr(self, name)
             if f is not None:
                 if iscoroutinefunction(f):
-                    self._loop.create_task(self._notify_callback_async(f(*args))
-                elif iscoroutine(f):
-                    self._loop.create_task(self._notify_callback_async(f)
+                    run_coroutine_threadsafe(f(self, *args), self._loop)
+
                 else:
-                    self._loop.call_soon_threadsafe(self._notify_callback, f, *args)
-        setattr(self._client, name, wrapper)
+                    self._loop.call_soon_threadsafe(f, self, *args)
+
+        if internal_callback:
+            def wrapper2(_client, *args):
+                self._loop.call_soon_threadsafe(internal_callback, *args)
+                wrapper(_client, *args)
+            setattr(self._client, name, wrapper2)
+        else:
+            setattr(self._client, name, wrapper)
 
     def _wrap_blocking_method(self, name):
         """Wrap a blocking function to make it async."""
@@ -130,3 +132,61 @@ class Client(object):
             self._loop.call_soon_threadsafe(
                 functools.partial(callback, self, *args, **kwargs))
         self._client.message_callback_add(sub, wrapper)
+
+    @functools.wraps(_Client.connect_async)
+    def connect_async(self, host, port=1883, keepalive=60, bind_address=""):
+        self._client.connect_async(host, port, keepalive, bind_address)
+        self.reconnect_task =  self._loop.create_task(self.reconnect())
+        return self.reconnect_task
+
+    def _socket_read_ssl(self):
+        while self._client.socket().pending():
+            rc = self._client.loop_read()
+            if rc or self._client.socket() is None:
+                break
+
+    def _socket_read(self):
+        self._client.loop_read()
+        # if rc or self._client.socket() is None:
+        #    # reconnect
+        #    pass
+
+    def _socket_write(self):
+        self._client.loop_write()
+        # if rc or self._client.socket() is None:
+        #    # reconnect
+        #    pass
+
+    def _on_socket_register_write(self, userdata, sock):
+        self._loop.add_writer(sock, self._socket_write)
+
+    def _on_socket_unregister_write(self, userdata, sock):
+        self._loop.remove_writer(sock)
+
+    def _on_socket_open(self, userdata, sock):
+        if hasattr(sock, "pending"):
+            self._loop.add_reader(sock, self._socket_read_ssl)
+        else:
+            self._loop.add_reader(sock, self._socket_read)
+        if self.misc_task:
+            self.misc_task.cancel()
+        self.misc_task = self._loop.create_task(self._misc())
+
+    def _on_socket_close(self, userdata, sock):
+        self._loop.remove_reader(sock)
+        self.misc_task.cancel()
+
+    def _on_disconnect(self, userdata, rc):
+        if rc != MQTT_ERR_SUCCESS:
+            assert self.reconnect_task.done()
+            self.reconnect_task = self._loop.create_task(self.reconnect())
+
+    async def _misc(self):
+        while True:
+            try:
+                await asyncio.sleep(1)
+            except CancelledError:
+                break
+            rc = self._client.loop_misc()
+            if rc or self._client.socket() is None:
+                break

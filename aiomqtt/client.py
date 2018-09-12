@@ -7,10 +7,10 @@ from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
 
 
-def wrap_callback(name, internal_callback=None):
-    orig_prop = getattr(_Client, name)
+def wrap_callback(func):
+    orig_prop = getattr(_Client, func.__name__)
     prop = property(None, None, None, orig_prop.__doc__)
-    internal_name = "_" + name
+    internal_name = "_" + func.__name__
 
     @prop.getter
     def prop(self):
@@ -27,17 +27,39 @@ def wrap_callback(name, internal_callback=None):
             def wrapper(_client, *args):
                 self._loop.call_soon_threadsafe(value, self, *args)
         if value is None:
-            setattr(self._client, name, None)
+            setattr(self._client, func.__name__, None)
         else:
-            if not internal_callback:
-                setattr(self._client, name, wrapper)
+            setattr(self._client, func.__name__, wrapper)
+    return prop
+
+
+def internal_callback(register_list):
+    def decorator(func):
+        orig_prop = prop = wrap_callback(func)
+        # override setter to call internal callback
+
+        @prop.setter
+        def prop(self, value):
+            orig_prop.__set__(self, value)
+            wrapper = getattr(self._client, func.__name__)
+            if wrapper is None:
+                def wrapper2(_client, *args):
+                    self._loop.call_soon_threadsafe(func, self, *args)
+                setattr(self._client, func.__name__, wrapper)
             else:
                 def wrapper2(_client, *args):
-                    self._loop.call_soon_threadsafe(
-                        internal_callback, self, *args)
+                    self._loop.call_soon_threadsafe(func, self, *args)
                     wrapper(_client, *args)
-                setattr(self._client, name, wrapper2)
-    return prop
+                setattr(self._client, func.__name__, wrapper2)
+
+        def register(self):
+            def wrapper2(_client, *args):
+                self._loop.call_soon_threadsafe(func, self, *args)
+            setattr(self._client, func.__name__, wrapper2)
+        register_list.append(register)
+
+        return prop
+    return decorator
 
 
 class MQTTMessageInfo(object):
@@ -87,33 +109,12 @@ class Client(object):
         self._wrap_blocking_method("connect")
         self._wrap_blocking_method("connect_srv")
         self._wrap_blocking_method("reconnect")
+        for register in self.internal_callbacks:
+            register(self)
 
     ###########################################################################
     # Utility functions for creating wrappers
     ###########################################################################
-
-    def _wrap_callback(self, name, internal_callback=None):
-        """Add the named callback to the MQTT client which triggers a call to
-        the wrapper's registered callback in the event loop thread.
-        """
-        setattr(self, name, None)
-
-        def wrapper(_client, *args):
-            f = getattr(self, name)
-            if f is not None:
-                if iscoroutinefunction(f):
-                    run_coroutine_threadsafe(f(self, *args), self._loop)
-
-                else:
-                    self._loop.call_soon_threadsafe(f, self, *args)
-
-        if internal_callback:
-            def wrapper2(_client, *args):
-                self._loop.call_soon_threadsafe(internal_callback, *args)
-                wrapper(_client, *args)
-            setattr(self._client, name, wrapper2)
-        else:
-            setattr(self._client, name, wrapper)
 
     def _wrap_blocking_method(self, name):
         """Wrap a blocking function to make it async."""
@@ -173,13 +174,18 @@ class Client(object):
         #    # reconnect
         #    pass
 
-    def __on_socket_register_write(self, userdata, sock):
+    internal_callbacks = []
+
+    @internal_callback(internal_callbacks)
+    def on_socket_register_write(self, userdata, sock):
         self._loop.add_writer(sock, self._socket_write)
 
-    def __on_socket_unregister_write(self, userdata, sock):
+    @internal_callback(internal_callbacks)
+    def on_socket_unregister_write(self, userdata, sock):
         self._loop.remove_writer(sock)
 
-    def __on_socket_open(self, userdata, sock):
+    @internal_callback(internal_callbacks)
+    def on_socket_open(self, userdata, sock):
         if hasattr(sock, "pending"):
             self._loop.add_reader(sock, self._socket_read_ssl)
         else:
@@ -188,14 +194,40 @@ class Client(object):
             self.misc_task.cancel()
         self.misc_task = self._loop.create_task(self.misc_loop())
 
-    def __on_socket_close(self, userdata, sock):
+    @internal_callback(internal_callbacks)
+    def on_socket_close(self, userdata, sock):
         self._loop.remove_reader(sock)
         self.misc_task.cancel()
 
-    def __on_disconnect(self, userdata, rc):
+    @internal_callback(internal_callbacks)
+    def on_disconnect(self, userdata, rc):
         if rc != MQTT_ERR_SUCCESS:
             assert self.reconnect_task.done()
             self.reconnect_task = self._loop.create_task(self.reconnect())
+
+    @wrap_callback
+    def on_connect(self):
+        pass
+
+    @wrap_callback
+    def on_message(self):
+        pass
+
+    @wrap_callback
+    def on_publish(self):
+        pass
+
+    @wrap_callback
+    def on_subscribe(self):
+        pass
+
+    @wrap_callback
+    def on_unsubscribe(self):
+        pass
+
+    @wrap_callback
+    def on_log(self):
+        pass
 
     async def misc_loop(self):
         while True:
@@ -206,18 +238,3 @@ class Client(object):
             rc = self._client.loop_misc()
             if rc or self._client.socket() is None:
                 break
-
-    on_connect = wrap_callback("on_connect")
-    on_message = wrap_callback("on_message")
-    on_publish = wrap_callback("on_publish")
-    on_subscribe = wrap_callback("on_subscribe")
-    on_unsubscribe = wrap_callback("on_unsubscribe")
-    on_log = wrap_callback("on_log")
-
-    on_disconnect = wrap_callback("on_disconnect", __on_disconnect)
-    on_socket_open = wrap_callback("on_socket_open", __on_socket_open)
-    on_socket_close = wrap_callback("on_socket_close", __on_socket_close)
-    on_socket_register_write = wrap_callback("on_socket_register_write",
-                                             __on_socket_register_write)
-    on_socket_unrigister_write = wrap_callback("on_socket_unregister_write",
-                                               __on_socket_unregister_write)

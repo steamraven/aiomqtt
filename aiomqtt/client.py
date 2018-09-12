@@ -7,6 +7,39 @@ from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
 
 
+def wrap_callback(name, internal_callback=None):
+    orig_prop = getattr(_Client, name)
+    prop = property(None, None, None, orig_prop.__doc__)
+    internal_name = "_" + name
+
+    @prop.getter
+    def prop(self):
+        return getattr(self, internal_name, None)
+
+    @prop.setter
+    def prop(self, value):
+        setattr(self, internal_name, value)
+
+        if iscoroutinefunction(value):
+            def wrapper(_client, *args):
+                run_coroutine_threadsafe(value(self, *args), self._loop)
+        else:
+            def wrapper(_client, *args):
+                self._loop.call_soon_threadsafe(value, self, *args)
+        if value is None:
+            setattr(self._client, name, None)
+        else:
+            if not internal_callback:
+                setattr(self._client, name, wrapper)
+            else:
+                def wrapper2(_client, *args):
+                    self._loop.call_soon_threadsafe(
+                        internal_callback, self, *args)
+                    wrapper(_client, *args)
+                setattr(self._client, name, wrapper2)
+    return prop
+
+
 class MQTTMessageInfo(object):
 
     def __init__(self, loop, mqtt_message_info):
@@ -54,23 +87,6 @@ class Client(object):
         self._wrap_blocking_method("connect")
         self._wrap_blocking_method("connect_srv")
         self._wrap_blocking_method("reconnect")
-
-        self._wrap_blocking_method("loop_forever")
-        self._wrap_blocking_method("loop_stop")
-
-        self._wrap_callback("on_connect")
-        self._wrap_callback("on_disconnect", self._on_disconnect)
-        self._wrap_callback("on_message")
-        self._wrap_callback("on_publish")
-        self._wrap_callback("on_subscribe")
-        self._wrap_callback("on_unsubscribe")
-        self._wrap_callback("on_log")
-        self._wrap_callback("on_socket_open", self._on_socket_open)
-        self._wrap_callback("on_socket_close", self._on_socket_close)
-        self._wrap_callback("on_socket_register_write",
-                            self._on_socket_register_write)
-        self._wrap_callback("on_socket_unregister_write",
-                            self._on_socket_unregister_write)
 
     ###########################################################################
     # Utility functions for creating wrappers
@@ -157,31 +173,31 @@ class Client(object):
         #    # reconnect
         #    pass
 
-    def _on_socket_register_write(self, userdata, sock):
+    def __on_socket_register_write(self, userdata, sock):
         self._loop.add_writer(sock, self._socket_write)
 
-    def _on_socket_unregister_write(self, userdata, sock):
+    def __on_socket_unregister_write(self, userdata, sock):
         self._loop.remove_writer(sock)
 
-    def _on_socket_open(self, userdata, sock):
+    def __on_socket_open(self, userdata, sock):
         if hasattr(sock, "pending"):
             self._loop.add_reader(sock, self._socket_read_ssl)
         else:
             self._loop.add_reader(sock, self._socket_read)
         if self.misc_task:
             self.misc_task.cancel()
-        self.misc_task = self._loop.create_task(self._misc())
+        self.misc_task = self._loop.create_task(self.misc_loop())
 
-    def _on_socket_close(self, userdata, sock):
+    def __on_socket_close(self, userdata, sock):
         self._loop.remove_reader(sock)
         self.misc_task.cancel()
 
-    def _on_disconnect(self, userdata, rc):
+    def __on_disconnect(self, userdata, rc):
         if rc != MQTT_ERR_SUCCESS:
             assert self.reconnect_task.done()
             self.reconnect_task = self._loop.create_task(self.reconnect())
 
-    async def _misc(self):
+    async def misc_loop(self):
         while True:
             try:
                 await asyncio.sleep(1)
@@ -190,3 +206,18 @@ class Client(object):
             rc = self._client.loop_misc()
             if rc or self._client.socket() is None:
                 break
+
+    on_connect = wrap_callback("on_connect")
+    on_message = wrap_callback("on_message")
+    on_publish = wrap_callback("on_publish")
+    on_subscribe = wrap_callback("on_subscribe")
+    on_unsubscribe = wrap_callback("on_unsubscribe")
+    on_log = wrap_callback("on_log")
+
+    on_disconnect = wrap_callback("on_disconnect", __on_disconnect)
+    on_socket_open = wrap_callback("on_socket_open", __on_socket_open)
+    on_socket_close = wrap_callback("on_socket_close", __on_socket_close)
+    on_socket_register_write = wrap_callback("on_socket_register_write",
+                                             __on_socket_register_write)
+    on_socket_unrigister_write = wrap_callback("on_socket_unregister_write",
+                                               __on_socket_unregister_write)

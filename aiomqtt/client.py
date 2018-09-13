@@ -1,10 +1,13 @@
 import asyncio
 import functools
+import socket
 from asyncio import (CancelledError, iscoroutinefunction,
                      run_coroutine_threadsafe)
+from typing import Any, List
 
 from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
+from paho.mqtt.client import WebsocketConnectionError
 
 
 def wrap_callback(func):
@@ -104,11 +107,15 @@ class Client(object):
         self._loop = loop or asyncio.get_event_loop()
         self._client = _Client(*args, **kwargs)
 
+        self._reconnect_delay = None
+        self._reconnect_min_delay = 1
+        self._reconnect_max_delay = 120
+
+        self._run = True
+
         self.misc_task = None
 
-        self._wrap_blocking_method("connect")
         self._wrap_blocking_method("connect_srv")
-        self._wrap_blocking_method("reconnect")
         for register in self.internal_callbacks:
             register(self)
 
@@ -150,11 +157,44 @@ class Client(object):
                 functools.partial(callback, self, *args, **kwargs))
         self._client.message_callback_add(sub, wrapper)
 
-    @functools.wraps(_Client.connect_async)
-    def connect_async(self, host, port=1883, keepalive=60, bind_address=""):
+    @functools.wraps(_Client.connect)
+    async def connect(self, host, port=1883, keepalive=60, bind_address="",
+                      retry=False):
         self._client.connect_async(host, port, keepalive, bind_address)
-        self.reconnect_task = self._loop.create_task(self.reconnect())
+        return await self.reconnect()
+
+    @functools.wraps(_Client.connect_async)
+    def connect_async(self, host, port=1883, keepalive=60, bind_address="",
+                      retry=False):
+        self._client.connect_async(host, port, keepalive, bind_address)
+        self.reconnect_task = self._loop.create_task(self.reconnect(retry))
         return self.reconnect_task
+
+    @functools.wraps(_Client.reconnect)
+    async def reconnect(self, retry=False):
+        while self._run:
+            try:
+                return await self._loop.run_in_executor(None, self._client.reconnect)
+            except (socket.error, OSError, WebsocketConnectionError):
+                if not retry:
+                    raise
+
+            await self._reconnect_wait()
+
+    @functools.wraps(_Client.reconnect_delay_set)
+    def reconnect_delay_set(self, min_delay=0, max_delay=120):
+        self._reconnect_min_delay = min_delay
+        self._reconnect_max_delay = max_delay
+
+    async def _reconnect_wait(self):
+        if self._reconnect_delay is None:
+            self._reconnect_delay = self._reconnect_min_delay
+        else:
+            self._reconnect_delay = min(
+                self._reconnect_delay * 2,
+                self._reconnect_max_delay
+            )
+        await asyncio.sleep(self._reconnect_delay)
 
     def _socket_read_ssl(self):
         while self._client.socket().pending():
@@ -174,7 +214,7 @@ class Client(object):
         #    # reconnect
         #    pass
 
-    internal_callbacks = []
+    internal_callbacks: List[Any] = []
 
     @internal_callback(internal_callbacks)
     def on_socket_register_write(self, userdata, sock):
@@ -201,13 +241,12 @@ class Client(object):
 
     @internal_callback(internal_callbacks)
     def on_disconnect(self, userdata, rc):
-        if rc != MQTT_ERR_SUCCESS:
-            assert self.reconnect_task.done()
-            self.reconnect_task = self._loop.create_task(self.reconnect())
+        if rc != MQTT_ERR_SUCCESS and self.reconnect_task.done():
+            self.reconnect_task = self._loop.create_task(self.reconnect(True))
 
-    @wrap_callback
-    def on_connect(self):
-        pass
+    @internal_callback(internal_callbacks)
+    def on_connect(self, userdata, flags_dict, result):
+        self._reconnect_delay = None
 
     @wrap_callback
     def on_message(self):

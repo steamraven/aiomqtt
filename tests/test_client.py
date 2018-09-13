@@ -6,9 +6,10 @@ import asyncio
 import logging
 
 import pytest
-from mock import Mock
+from mock import Mock, patch
 
 import aiomqtt
+import socket as _socket
 
 
 @pytest.fixture("module")
@@ -67,6 +68,7 @@ async def test_connect_and_loop_forever(server, hostname, port, event_loop):
     """Tests connecting and then disconnecting from the MQTT server while using
     the loop_forever construct.
     """
+
     c = aiomqtt.Client(loop=event_loop)
 
     # Immediately disconnect on connection
@@ -102,6 +104,60 @@ async def test_connect_and_loop_forever(server, hostname, port, event_loop):
     assert c.on_connect.called
     assert disconnect_event.is_set()
     assert c.on_disconnect.called
+
+
+@pytest.mark.asyncio
+@patch('socket.create_connection')
+async def test_reconnect(create_connection, server, hostname, port, event_loop):
+    """Tests connecting and then disconnecting from the MQTT server while using
+    the loop_forever construct.
+    """
+    create_connection.side_effect = _socket.create_connection
+    c = aiomqtt.Client(loop=event_loop)
+    c.enable_logger()
+
+    # Immediately disconnect on connection
+    connect_event = asyncio.Event(loop=event_loop)
+
+    num_called = 0
+
+    def on_connect(client, userdata, flags, rc):
+        assert client is c
+        assert userdata is None
+        assert isinstance(flags, dict)
+        assert rc == aiomqtt.MQTT_ERR_SUCCESS
+
+        connect_event.set()
+        nonlocal num_called
+        num_called += 1
+        if num_called == 1:
+            create_connection.return_value.close()
+        elif num_called == 2:
+            c.disconnect()
+        else:
+            assert False, "Called more than twice"
+    c.on_connect = Mock(side_effect=on_connect)
+
+    # Just check disconnect event is as expected
+    disconnect_event = asyncio.Event(loop=event_loop)
+
+    def on_disconnect1(client, userdata, rc):
+        assert client is c
+        assert userdata is None
+
+        if rc == aiomqtt.MQTT_ERR_SUCCESS:
+            disconnect_event.set()
+    c.on_disconnect = Mock(side_effect=on_disconnect1)
+
+    # When the client disconnects, this call should end
+    c.connect_async(hostname, port)
+    await asyncio.wait_for(disconnect_event.wait(), timeout=5, loop=event_loop)
+
+    # Should definately have connected and disconnected
+    assert connect_event.is_set()
+    assert len(c.on_connect.mock_call) == 2
+    assert disconnect_event.is_set()
+    assert len(c.on_disconnect.mock_call) == 2
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,8 @@ from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
 from paho.mqtt.client import WebsocketConnectionError
 
+import logging
+
 
 def wrap_callback(func):
     orig_prop = getattr(_Client, func.__name__)
@@ -25,9 +27,11 @@ def wrap_callback(func):
 
         if iscoroutinefunction(value):
             def wrapper(_client, *args):
+                logging.debug("Calling coroutine: %s", func.__name__)
                 run_coroutine_threadsafe(value(self, *args), self._loop)
         else:
             def wrapper(_client, *args):
+                logging.debug("Calling callback: %s", func.__name__)
                 self._loop.call_soon_threadsafe(value, self, *args)
         if value is None:
             setattr(self._client, func.__name__, None)
@@ -47,10 +51,14 @@ def internal_callback(register_list):
             wrapper = getattr(self._client, func.__name__)
             if wrapper is None:
                 def wrapper2(_client, *args):
+                    logging.debug(
+                        "Calling internal callback: %s", func.__name__)
                     self._loop.call_soon_threadsafe(func, self, *args)
                 setattr(self._client, func.__name__, wrapper)
             else:
                 def wrapper2(_client, *args):
+                    logging.debug(
+                        "Calling internal callback: %s", func.__name__)
                     self._loop.call_soon_threadsafe(func, self, *args)
                     wrapper(_client, *args)
                 setattr(self._client, func.__name__, wrapper2)
@@ -66,17 +74,23 @@ def internal_callback(register_list):
 
 
 class MQTTMessageInfo(object):
+    __slots__ = ["client", "_mqtt_message_info"]
 
-    def __init__(self, loop, mqtt_message_info):
-        self._loop = loop
+    def __init__(self, client, mqtt_message_info):
+        self.client = client
         self._mqtt_message_info = mqtt_message_info
 
     def __getattr__(self, name):
         return getattr(self._mqtt_message_info, name)
 
     async def wait_for_publish(self):
-        return await self._loop.run_in_executor(
-            None, self._mqtt_message_info.wait_for_publish)
+        if self._mqtt_message_info.is_published():
+            return
+        mid = self._mqtt_message_info.mid
+        event = asyncio.Event()
+        self.client.waiting[mid] = event
+        await event.wait()
+        del self.client.waiting[mid]
 
     def __iter__(self):
         return iter(self._mqtt_message_info)
@@ -146,7 +160,7 @@ class Client(object):
         # Produce an alternative MQTTMessageInfo object with a coroutine
         # wait_for_publish.
         return MQTTMessageInfo(
-            self._loop, self._client.publish(*args, **kwargs))
+            self, self._client.publish(*args, **kwargs))
 
     @functools.wraps(_Client.message_callback_add)
     def message_callback_add(self, sub, callback):
@@ -174,7 +188,8 @@ class Client(object):
     async def reconnect(self, retry=False):
         while self._run:
             try:
-                return await self._loop.run_in_executor(None, self._client.reconnect)
+                return await self._loop.run_in_executor(
+                    None, self._client.reconnect)
             except (socket.error, OSError, WebsocketConnectionError):
                 if not retry:
                     raise
@@ -214,6 +229,18 @@ class Client(object):
         #    # reconnect
         #    pass
 
+    async def misc_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(1)
+            except CancelledError:
+                logging.info("misc_loop Sleep cancelled")
+                break
+            rc = self._client.loop_misc()
+            if rc or self._client.socket() is None:
+                logging.info("misc_loop returned %d", rc)
+                break
+
     internal_callbacks: List[Any] = []
 
     @internal_callback(internal_callbacks)
@@ -230,9 +257,6 @@ class Client(object):
             self._loop.add_reader(sock, self._socket_read_ssl)
         else:
             self._loop.add_reader(sock, self._socket_read)
-        if self.misc_task:
-            self.misc_task.cancel()
-        self.misc_task = self._loop.create_task(self.misc_loop())
 
     @internal_callback(internal_callbacks)
     def on_socket_close(self, userdata, sock):
@@ -241,19 +265,26 @@ class Client(object):
 
     @internal_callback(internal_callbacks)
     def on_disconnect(self, userdata, rc):
-        if rc != MQTT_ERR_SUCCESS and self.reconnect_task.done():
-            self.reconnect_task = self._loop.create_task(self.reconnect(True))
+        if rc != MQTT_ERR_SUCCESS:
+            logging.info("Disconnect on error: %d", rc)
+            if self.reconnect_task.done():
+                logging.info("Reconnecting on disconnect")
+                self.reconnect_task = self._loop.create_task(
+                    self.reconnect(True))
 
     @internal_callback(internal_callbacks)
     def on_connect(self, userdata, flags_dict, result):
         self._reconnect_delay = None
+        if not self.misc_task or self.misc_task.done():
+            self.misc_task = self._loop.create_task(self.misc_loop())
+
+    @internal_callback(internal_callbacks)
+    def on_publish(self, userdata, mid):
+        if mid in self.waiting:
+            self.waiting[mid].set()
 
     @wrap_callback
     def on_message(self):
-        pass
-
-    @wrap_callback
-    def on_publish(self):
         pass
 
     @wrap_callback
@@ -267,13 +298,3 @@ class Client(object):
     @wrap_callback
     def on_log(self):
         pass
-
-    async def misc_loop(self):
-        while True:
-            try:
-                await asyncio.sleep(1)
-            except CancelledError:
-                break
-            rc = self._client.loop_misc()
-            if rc or self._client.socket() is None:
-                break

@@ -9,7 +9,6 @@ import pytest
 from mock import Mock
 
 import aiomqtt
-
 from tcp_proxy import TcpProxy
 
 
@@ -74,13 +73,10 @@ def test_native_client(server, hostname, port):
 
 
 @pytest.mark.asyncio
-async def test_connect_and_loop_forever(server, hostname, port, event_loop):
+async def test_connect_and_disconnect(server, hostname, port, event_loop):
     """Tests connecting and then disconnecting from the MQTT server"""
 
     c = aiomqtt.Client(loop=event_loop)
-
-    # Immediately disconnect on connection
-    connect_event = asyncio.Event(loop=event_loop)
 
     def on_connect(client, userdata, flags, rc):
         assert client is c
@@ -88,30 +84,22 @@ async def test_connect_and_loop_forever(server, hostname, port, event_loop):
         assert isinstance(flags, dict)
         assert rc == aiomqtt.MQTT_ERR_SUCCESS
 
-        connect_event.set()
         c.disconnect()
     c.on_connect = Mock(side_effect=on_connect)
-
-    # Just check disconnect event is as expected
-    disconnect_event = asyncio.Event(loop=event_loop)
 
     def on_disconnect(client, userdata, rc):
         assert client is c
         assert userdata is None
         assert rc == aiomqtt.MQTT_ERR_SUCCESS
-
-        disconnect_event.set()
     c.on_disconnect = Mock(side_effect=on_disconnect)
 
     # When the client disconnects, this call should end
     c.connect_async(hostname, port)
-    await asyncio.wait_for(disconnect_event.wait(), timeout=5, loop=event_loop)
+    await asyncio.wait_for(c.wait_for_disconnect(), timeout=5, loop=event_loop)
 
     # Should definately have connected and disconnected
-    assert connect_event.is_set()
-    assert c.on_connect.called
-    assert disconnect_event.is_set()
-    assert c.on_disconnect.called
+    assert c.on_connect.call_count == 1
+    assert c.on_disconnect.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -145,17 +133,19 @@ async def test_reconnect(server, tcp_proxy, hostname, port, event_loop):
     def on_disconnect(client, userdata, rc):
         assert client is c
         assert userdata is None
-
+        if disconnect_event.is_set():
+            assert rc == aiomqtt.MQTT_ERR_SUCCESS
+        else:
+            assert rc != aiomqtt.MQTT_ERR_SUCCESS
+        disconnect_event.set()
         logging.debug("Disconnect: %d", rc)
 
-        if rc == aiomqtt.MQTT_ERR_SUCCESS:
-            disconnect_event.set()
     c.on_disconnect = Mock(side_effect=on_disconnect)
 
     await tcp_proxy.connect()
     c.connect_async('127.0.0.1', tcp_proxy.local_port, keepalive=2)
-    await asyncio.wait_for(disconnect_event.wait(),
-                           timeout=10, loop=event_loop)
+    await asyncio.wait_for(c.wait_for_disconnect(),
+                           timeout=5, loop=event_loop)
 
     # Should definately have connected and disconnected
     assert connect_event.is_set()
@@ -198,18 +188,19 @@ async def test_reconnect_on_ping(server, tcp_proxy,
         assert userdata is None
 
         logging.debug("Disconnect: %d", rc)
-
-        if rc == aiomqtt.MQTT_ERR_SUCCESS:
-            disconnect_event.set()
+        if disconnect_event.is_set():
+            assert rc == aiomqtt.MQTT_ERR_SUCCESS
         else:
+            assert rc != aiomqtt.MQTT_ERR_SUCCESS
             logging.debug("Stopping discard")
             tcp_proxy.stop_discard()
+        disconnect_event.set()
     c.on_disconnect = Mock(side_effect=on_disconnect)
 
     await tcp_proxy.connect()
     c.connect_async('127.0.0.1', tcp_proxy.local_port, keepalive=2)
-    await asyncio.wait_for(disconnect_event.wait(),
-                           timeout=10, loop=event_loop)
+    await asyncio.wait_for(c.wait_for_disconnect(),
+                           timeout=5, loop=event_loop)
 
     # Should definately have connected and disconnected
     assert connect_event.is_set()
@@ -226,7 +217,6 @@ async def test_reconnect_on_connect(server, tcp_proxy,
     c.enable_logger()
 
     # Immediately disconnect on connection
-    connect_event = asyncio.Event(loop=event_loop)
 
     def on_connect(client, userdata, flags, rc):
         assert client is c
@@ -234,35 +224,29 @@ async def test_reconnect_on_connect(server, tcp_proxy,
         assert isinstance(flags, dict)
         assert rc == aiomqtt.MQTT_ERR_SUCCESS
 
-        connect_event.set()
         c.disconnect()
     c.on_connect = Mock(side_effect=on_connect)
 
     # Just check disconnect event is as expected
-    disconnect_event = asyncio.Event(loop=event_loop)
 
     def on_disconnect(client, userdata, rc):
         assert client is c
         assert userdata is None
-
+        assert rc == aiomqtt.MQTT_ERR_SUCCESS
         logging.debug("Disconnect: %d", rc)
-
-        disconnect_event.set()
 
     c.on_disconnect = Mock(side_effect=on_disconnect)
 
-    c.connect_async('127.0.0.1', tcp_proxy.local_port, keepalive=5, retry=True)
+    c.connect_async('127.0.0.1', tcp_proxy.local_port, keepalive=2, retry=True)
     await asyncio.sleep(1)
     assert not c.reconnect_task.done()
 
     await tcp_proxy.connect()
-    await asyncio.wait_for(disconnect_event.wait(),
-                           timeout=500, loop=event_loop)
+    await asyncio.wait_for(c.wait_for_disconnect(),
+                           timeout=5, loop=event_loop)
 
     # Should definately have connected and disconnected
-    assert connect_event.is_set()
     assert c.on_connect.call_count == 1
-    assert disconnect_event.is_set()
     assert c.on_disconnect.call_count == 1
 
 
@@ -274,7 +258,7 @@ async def test_no_reconnect(unused_tcp_port, event_loop):
     c.enable_logger()
     # first test error when retry is false
     with pytest.raises(ConnectionRefusedError):
-        await c.connect('127.0.0.1', unused_tcp_port, keepalive=5, retry=False)
+        await c.connect('127.0.0.1', unused_tcp_port, keepalive=2, retry=False)
 
 
 @pytest.mark.asyncio
@@ -286,9 +270,6 @@ async def test_pub_sub(server, hostname, port, event_loop):
 
     c.enable_logger()
     logging.basicConfig(level=logging.DEBUG)
-
-    connect_event = asyncio.Event(loop=event_loop)
-    c.on_connect = Mock(side_effect=lambda *_: connect_event.set())
 
     subscribe_event = asyncio.Event(loop=event_loop)
     c.on_subscribe = Mock(side_effect=lambda *_: subscribe_event.set())
@@ -307,13 +288,8 @@ async def test_pub_sub(server, hostname, port, event_loop):
     unsubscribe_event = asyncio.Event(loop=event_loop)
     c.on_unsubscribe = Mock(side_effect=lambda *_: unsubscribe_event.set())
 
-    disconnect_event = asyncio.Event(loop=event_loop)
-    c.on_disconnect = Mock(side_effect=lambda *_: disconnect_event.set())
-
     try:
-        c.connect_async(hostname, port)
-        await asyncio.wait_for(
-            connect_event.wait(), timeout=5, loop=event_loop)
+        await c.connect(hostname, port)
 
         # Test subscription
         result, mid = c.subscribe("test")
@@ -364,15 +340,13 @@ async def test_pub_sub(server, hostname, port, event_loop):
             unsubscribe_event.wait(), timeout=5, loop=event_loop)
         c.on_unsubscribe.assert_called_once_with(c, None, mid)
         c.disconnect()
-        await asyncio.wait_for(disconnect_event.wait(), timeout=5,
+        await asyncio.wait_for(c.wait_for_disconnect(), timeout=5,
                                loop=event_loop)
     finally:
         pass
 
-    assert len(c.on_connect.mock_calls) == 1
     assert len(c.on_subscribe.mock_calls) == 1
     assert len(c.on_publish.mock_calls) == 2
     assert len(c.on_message.mock_calls) == 1
     assert len(message_callback.mock_calls) == 1
     assert len(c.on_unsubscribe.mock_calls) == 1
-    assert len(c.on_disconnect.mock_calls) == 1

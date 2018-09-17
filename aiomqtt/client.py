@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import logging
 import socket
 from asyncio import (CancelledError, iscoroutinefunction,
                      run_coroutine_threadsafe)
@@ -8,8 +9,6 @@ from typing import Any, List
 from paho.mqtt.client import MQTT_ERR_SUCCESS
 from paho.mqtt.client import Client as _Client
 from paho.mqtt.client import WebsocketConnectionError
-
-import logging
 
 
 def wrap_callback(func):
@@ -86,6 +85,10 @@ class MQTTMessageInfo(object):
     async def wait_for_publish(self):
         if self._mqtt_message_info.is_published():
             return
+        # Sepcial consideration if message is published in the
+        # "reconnect" thread.  If is_published is false,
+        # then the on_publish callback will be scheduled using
+        # "call_soon" and guaranteed to run AFTER this coroutine.
         mid = self._mqtt_message_info.mid
         event = asyncio.Event()
         self.client.waiting[mid] = event
@@ -127,11 +130,18 @@ class Client(object):
 
         self._run = True
 
+        self.waiting = {}  # list of events of messages waiting to be published
+
         self.misc_task = None
+        self.disconnect_event = asyncio.Event()
+        self.reconnect_task = None
 
         self._wrap_blocking_method("connect_srv")
         for register in self.internal_callbacks:
             register(self)
+
+    async def wait_for_disconnect(self):
+        await self.disconnect_event.wait()
 
     ###########################################################################
     # Utility functions for creating wrappers
@@ -174,18 +184,27 @@ class Client(object):
     @functools.wraps(_Client.connect)
     async def connect(self, host, port=1883, keepalive=60, bind_address="",
                       retry=False):
+        # reconnect for initial connection is immediately awaited
+        # This will easily propogate connection exceptions
         self._client.connect_async(host, port, keepalive, bind_address)
         return await self.reconnect()
 
     @functools.wraps(_Client.connect_async)
     def connect_async(self, host, port=1883, keepalive=60, bind_address="",
                       retry=False):
+        # reconnect for initial connection is run in the background
+        # Connection exceptions will not be reraised unless the reconnect_task
+        # is checked or awaited
         self._client.connect_async(host, port, keepalive, bind_address)
         self.reconnect_task = self._loop.create_task(self.reconnect(retry))
+        self._run = True
+        self.disconnect_event = asyncio.Event()
         return self.reconnect_task
 
     @functools.wraps(_Client.reconnect)
     async def reconnect(self, retry=False):
+        # Runs reconnect in a separate thread.
+        logging.debug("Reconnect")
         while self._run:
             try:
                 return await self._loop.run_in_executor(
@@ -193,15 +212,21 @@ class Client(object):
             except (socket.error, OSError, WebsocketConnectionError):
                 if not retry:
                     raise
+            if self._run:
+                await self._reconnect_wait()
 
-            await self._reconnect_wait()
+    # @functools.wraps(_Client.disconnect)
+    # def disconnect(self):
+    #     return self._client.disconnect()
 
     @functools.wraps(_Client.reconnect_delay_set)
     def reconnect_delay_set(self, min_delay=0, max_delay=120):
+        # Reimplement reconnection logic from paho
         self._reconnect_min_delay = min_delay
         self._reconnect_max_delay = max_delay
 
     async def _reconnect_wait(self):
+        # reimplement reconnection logic from paho
         if self._reconnect_delay is None:
             self._reconnect_delay = self._reconnect_min_delay
         else:
@@ -212,24 +237,22 @@ class Client(object):
         await asyncio.sleep(self._reconnect_delay)
 
     def _socket_read_ssl(self):
+        # Call loop_read when socket is ready. Handle ssl weirdness
         while self._client.socket().pending():
             rc = self._client.loop_read()
             if rc or self._client.socket() is None:
                 break
 
     def _socket_read(self):
+        # Call loop_read when socket is ready
         self._client.loop_read()
-        # if rc or self._client.socket() is None:
-        #    # reconnect
-        #    pass
 
     def _socket_write(self):
+        # call loop_write when socket is ready
         self._client.loop_write()
-        # if rc or self._client.socket() is None:
-        #    # reconnect
-        #    pass
 
     async def misc_loop(self):
+        # call loop_misc on a regular basis
         while True:
             try:
                 await asyncio.sleep(1)
@@ -241,18 +264,22 @@ class Client(object):
                 logging.info("misc_loop returned %d", rc)
                 break
 
+    # keep track of internal callbacks on register them in init
     internal_callbacks: List[Any] = []
 
     @internal_callback(internal_callbacks)
     def on_socket_register_write(self, userdata, sock):
+        # Set callback when socket is ready for write
         self._loop.add_writer(sock, self._socket_write)
 
     @internal_callback(internal_callbacks)
     def on_socket_unregister_write(self, userdata, sock):
+        # unset callback
         self._loop.remove_writer(sock)
 
     @internal_callback(internal_callbacks)
     def on_socket_open(self, userdata, sock):
+        # Setup callbacks for socket reading
         if hasattr(sock, "pending"):
             self._loop.add_reader(sock, self._socket_read_ssl)
         else:
@@ -260,26 +287,35 @@ class Client(object):
 
     @internal_callback(internal_callbacks)
     def on_socket_close(self, userdata, sock):
+        # cleanup on socket close
         self._loop.remove_reader(sock)
         self.misc_task.cancel()
 
     @internal_callback(internal_callbacks)
     def on_disconnect(self, userdata, rc):
+        # reconnect on error
         if rc != MQTT_ERR_SUCCESS:
             logging.info("Disconnect on error: %d", rc)
-            if self.reconnect_task.done():
+            if self.reconnect_task and self.reconnect_task.done():
                 logging.info("Reconnecting on disconnect")
                 self.reconnect_task = self._loop.create_task(
                     self.reconnect(True))
+        else:
+            self._run = False
+            if self.reconnect_task and not self.reconnect_task.done():
+                self.reconnect_task.cancel()
+            self.disconnect_event.set()
 
     @internal_callback(internal_callbacks)
     def on_connect(self, userdata, flags_dict, result):
+        # Make sure misc_loop is started, and reconnect_delay is reset
         self._reconnect_delay = None
         if not self.misc_task or self.misc_task.done():
             self.misc_task = self._loop.create_task(self.misc_loop())
 
     @internal_callback(internal_callbacks)
     def on_publish(self, userdata, mid):
+        # Signal if any message is awaiting publication
         if mid in self.waiting:
             self.waiting[mid].set()
 

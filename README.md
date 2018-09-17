@@ -29,30 +29,20 @@ is shown below:
     
     async def demo():
         c = aiomqtt.Client(loop)
-        c.loop_start()  # See "About that loop..." below.
         
         connected = asyncio.Event(loop=loop)
-        def on_connect(client, userdata, flags, rc):
-            connected.set()
-        c.on_connect = on_connect
-        
         await c.connect("localhost")
-        await connected.wait()
         print("Connected!")
         
-        subscribed = asyncio.Event(loop=loop)
-        def on_subscribe(client, userdata, mid, granted_qos):
-            subscribed.set()
-        c.on_subscribe = on_subscribe
-        
-        c.subscribe("my/test/path")
-        await subscribed.wait()
-        print("Subscribed to my/test/path")
-        
-        def on_message(client, userdata, message):
+
+        async def on_message(client, userdata, message):
             print("Got message:", message.topic, message.payload)
-        c.on_message = on_message
-        
+
+        c.message_callback_add("my/test/path", on_message)
+
+        c.subscribe("my/test/path")
+        print("Subscribed to my/test/path")
+                
         message_info = c.publish("my/test/path", "Hello, world")
         await message_info.wait_for_publish()
         print("Message published!")
@@ -68,8 +58,6 @@ is shown below:
         await disconnected.wait()
         print("Disconnected")
         
-        await c.loop_stop()
-        print("MQTT loop stopped!")
     
     loop.run_until_complete(demo())
 
